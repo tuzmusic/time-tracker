@@ -60,11 +60,18 @@ final class Store: ObservableObject {
     }
 
     func toggle() {
-        if let running = runningEntry, let i = data.entries.firstIndex(of: running) {
-            data.entries[i].end = Date()
-        } else {
-            data.entries.append(Entry(projectID: project.id, start: Date()))
-        }
+        runningEntry == nil ? start() : stop()
+    }
+
+    func start() {
+        guard runningEntry == nil else { return }
+        data.entries.append(Entry(projectID: project.id, start: Date()))
+        save()
+    }
+
+    func stop() {
+        guard let running = runningEntry, let i = data.entries.firstIndex(of: running) else { return }
+        data.entries[i].end = Date()
         save()
     }
 
@@ -87,8 +94,8 @@ final class Store: ObservableObject {
         save()
     }
 
-    func delete(_ entry: Entry) {
-        data.entries.removeAll { $0.id == entry.id }
+    func delete(id: UUID) {
+        data.entries.removeAll { $0.id == id }
         save()
     }
 

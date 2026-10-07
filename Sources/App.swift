@@ -11,7 +11,20 @@ struct TimeTrackerApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 380, minHeight: 460)
         }
+        .defaultSize(width: 380, height: 460)
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("Start Timer") { store.start() }
+                    .keyboardShortcut("n")
+                    .disabled(store.runningEntry != nil)
+            }
+            CommandGroup(replacing: .saveItem) {
+                Button("Stop Timer") { store.stop() }
+                    .keyboardShortcut("s")
+                    .disabled(store.runningEntry == nil)
+            }
+        }
     }
 }
 
@@ -19,6 +32,8 @@ final class UIState: ObservableObject {
     @Published var editingName = false
     @Published var nameDraft = ""
     @Published var entryDraft: EntryDraft?
+    @Published var selection: UUID?
+    @Published var pendingDelete: UUID?
 }
 
 /// Backing state for the add/edit entry sheet. `entryID == nil` means a new manual entry.
@@ -28,6 +43,7 @@ final class EntryDraft: ObservableObject, Identifiable {
     let isRunning: Bool
     @Published var start: Date
     @Published var end: Date
+    @Published var confirmingDelete = false
 
     init(entry: Entry? = nil) {
         entryID = entry?.id
@@ -49,6 +65,7 @@ struct EntrySheet: View {
     @ObservedObject var draft: EntryDraft
     let onSave: () -> Void
     let onCancel: () -> Void
+    let onDelete: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -63,6 +80,9 @@ struct EntrySheet: View {
                 }
             }
             HStack {
+                if draft.entryID != nil {
+                    Button("Delete", role: .destructive) { draft.confirmingDelete = true }
+                }
                 Spacer()
                 Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
                 Button("Save", action: onSave)
@@ -72,6 +92,11 @@ struct EntrySheet: View {
         }
         .padding(20)
         .frame(width: 340)
+        .confirmationDialog("Delete this entry?", isPresented: $draft.confirmingDelete) {
+            Button("Delete", role: .destructive, action: onDelete)
+        } message: {
+            Text("This can't be undone.")
+        }
     }
 
     private var durationText: String {
@@ -106,7 +131,10 @@ struct ContentView: View {
                     store.addEntry(start: draft.start, end: draft.end)
                 }
                 ui.entryDraft = nil
-            }, onCancel: { ui.entryDraft = nil })
+            }, onCancel: { ui.entryDraft = nil }, onDelete: {
+                if let id = draft.entryID { store.delete(id: id) }
+                ui.entryDraft = nil
+            })
         }
     }
 
@@ -161,7 +189,7 @@ struct ContentView: View {
     }
 
     private func entryList(now: Date) -> some View {
-        List {
+        List(selection: $ui.selection) {
             ForEach(groupedByDay(), id: \.day) { group in
                 Section(group.day.formatted(.dateTime.weekday(.wide).month().day())) {
                     ForEach(group.entries) { entry in
@@ -172,15 +200,34 @@ struct ContentView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(entry.end == nil ? .green : .primary)
                         }
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { ui.entryDraft = EntryDraft(entry: entry) }
-                        .contextMenu {
-                            Button("Edit…") { ui.entryDraft = EntryDraft(entry: entry) }
-                            Button("Delete", role: .destructive) { store.delete(entry) }
-                        }
+                        .tag(entry.id)
                     }
                 }
             }
+        }
+        .contextMenu(forSelectionType: UUID.self) { ids in
+            if let id = ids.first {
+                Button("Edit…") { edit(id) }
+                Button("Delete", role: .destructive) { ui.pendingDelete = id }
+            }
+        } primaryAction: { ids in
+            if let id = ids.first { edit(id) }
+        }
+        .onDeleteCommand {
+            ui.pendingDelete = ui.selection
+        }
+        .confirmationDialog("Delete this entry?", isPresented: Binding(
+            get: { ui.pendingDelete != nil },
+            set: { if !$0 { ui.pendingDelete = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                if let id = ui.pendingDelete {
+                    store.delete(id: id)
+                    if ui.selection == id { ui.selection = nil }
+                }
+            }
+        } message: {
+            Text("This can't be undone.")
         }
         .overlay {
             if store.entries.isEmpty {
@@ -199,7 +246,7 @@ struct ContentView: View {
             Spacer()
             Button("Add Entry…") { ui.entryDraft = EntryDraft() }
                 .controlSize(.small)
-                .keyboardShortcut("n")
+                .keyboardShortcut("n", modifiers: [.command, .shift])
             Button("Reveal") {
                 NSWorkspace.shared.activateFileViewerSelecting([Store.fileURL])
             }
@@ -210,6 +257,12 @@ struct ContentView: View {
     }
 
     // MARK: helpers
+
+    private func edit(_ id: UUID) {
+        if let entry = store.entries.first(where: { $0.id == id }) {
+            ui.entryDraft = EntryDraft(entry: entry)
+        }
+    }
 
     private func groupedByDay() -> [(day: Date, entries: [Entry])] {
         let cal = Calendar.current
