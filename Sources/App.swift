@@ -9,9 +9,9 @@ struct TimeTrackerApp: App {
         Window("Time Tracker", id: "main") {
             ContentView()
                 .environmentObject(store)
-                .frame(minWidth: 380, minHeight: 460)
+                .frame(minWidth: 380, minHeight: 560)
         }
-        .defaultSize(width: 380, height: 460)
+        .defaultSize(width: 380, height: 560)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -34,6 +34,8 @@ final class UIState: ObservableObject {
     @Published var entryDraft: EntryDraft?
     @Published var selection: UUID?
     @Published var pendingDelete: UUID?
+    @Published var goalDraft: GoalDraft?
+    @Published var pendingGoalDelete: UUID?
 }
 
 /// Backing state for the add/edit entry sheet. `entryID == nil` means a new manual entry.
@@ -118,6 +120,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header(now: now)
                 Divider()
+                goalsSection(now: now)
+                Divider()
                 entryList(now: now)
                 Divider()
                 footer
@@ -135,6 +139,31 @@ struct ContentView: View {
                 if let id = draft.entryID { store.delete(id: id) }
                 ui.entryDraft = nil
             })
+        }
+        .sheet(item: $ui.goalDraft) { draft in
+            GoalSheet(draft: draft, templates: store.allGoals, onSave: {
+                store.saveGoal(draft.makeGoal(projectID: store.project.id))
+                ui.goalDraft = nil
+            }, onCancel: { ui.goalDraft = nil }, onDelete: {
+                if let id = draft.goalID { store.deleteGoal(id: id) }
+                ui.goalDraft = nil
+            })
+        }
+        .alert("Goal met! 🎉", isPresented: Binding(
+            get: { store.metGoal != nil },
+            set: { if !$0 { store.metGoal = nil } }
+        ), presenting: store.metGoal) { goal in
+            if store.hasSuccessor(goal) {
+                Button("Nice") {}
+            } else {
+                Button("Set Up Next Goal…") {
+                    let draft = GoalDraft(template: goal)
+                    DispatchQueue.main.async { ui.goalDraft = draft }
+                }
+                Button("Not Now", role: .cancel) {}
+            }
+        } message: { goal in
+            Text("You hit \(goal.hours.formatted()) hours for “\(goal.name)”.")
         }
     }
 
@@ -179,6 +208,42 @@ struct ContentView: View {
             }
         }
         .padding(20)
+    }
+
+    private func goalsSection(now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Goals").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    ui.goalDraft = GoalDraft(template: store.allGoals.first)
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .help("New goal")
+            }
+            ForEach(store.activeGoals) { goal in
+                GoalRow(goal: goal, progress: store.progress(goal, now: now), now: now)
+                    .onTapGesture(count: 2) { ui.goalDraft = GoalDraft(goal: goal) }
+                    .contextMenu {
+                        Button("Edit…") { ui.goalDraft = GoalDraft(goal: goal) }
+                        Button("Delete", role: .destructive) { ui.pendingGoalDelete = goal.id }
+                    }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .confirmationDialog("Delete this goal?", isPresented: Binding(
+            get: { ui.pendingGoalDelete != nil },
+            set: { if !$0 { ui.pendingGoalDelete = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                if let id = ui.pendingGoalDelete { store.deleteGoal(id: id) }
+            }
+        } message: {
+            Text("This can't be undone.")
+        }
     }
 
     private func stat(_ label: String, _ value: TimeInterval) -> some View {

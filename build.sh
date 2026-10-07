@@ -13,6 +13,8 @@ swiftc -O -parse-as-library -swift-version 5 \
   Sources/*.swift \
   -o "$APP/Contents/MacOS/TimeTracker"
 
+cp Icon/AppIcon.icns "$APP/Contents/Resources/"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -21,6 +23,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>TimeTracker</string>
   <key>CFBundleDisplayName</key><string>Time Tracker</string>
   <key>CFBundleIdentifier</key><string>com.tuzman.timetracker</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleExecutable</key><string>TimeTracker</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>

@@ -16,15 +16,67 @@ struct Entry: Codable, Identifiable, Hashable {
     }
 }
 
+/// A target number of hours over an inclusive range of days.
+struct Goal: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+    var projectID: UUID
+    var name: String
+    var hours: Double
+    /// Start of the first day.
+    var start: Date
+    /// Start of the last day (inclusive).
+    var end: Date
+    /// When the goal ends, roll it over to the next week instead of just archiving it.
+    var repeats: Bool
+    var archived = false
+    var congratulated = false
+    /// The goal this one was created from, so a repeating goal isn't rolled over twice.
+    var previousGoalID: UUID?
+
+    var target: TimeInterval { hours * 3600 }
+    var endExclusive: Date { Calendar.current.date(byAdding: .day, value: 1, to: end)! }
+
+    /// The same days shifted forward by the fewest whole weeks (at least one)
+    /// that makes the period still current on `today`.
+    func nextPeriod(today: Date) -> (start: Date, end: Date) {
+        let cal = Calendar.current
+        var weeks = 1
+        while true {
+            let e = cal.date(byAdding: .day, value: 7 * weeks, to: end)!
+            if e >= today {
+                return (cal.date(byAdding: .day, value: 7 * weeks, to: start)!, e)
+            }
+            weeks += 1
+        }
+    }
+}
+
 struct AppData: Codable {
     var version = 1
     var projects: [Project]
     var entries: [Entry]
+    var goals: [Goal] = []
+
+    init(projects: [Project], entries: [Entry]) {
+        self.projects = projects
+        self.entries = entries
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        projects = try c.decode([Project].self, forKey: .projects)
+        entries = try c.decode([Entry].self, forKey: .entries)
+        goals = try c.decodeIfPresent([Goal].self, forKey: .goals) ?? []
+    }
 }
 
 /// Persists everything to a single JSON file in Application Support.
 final class Store: ObservableObject {
     @Published private(set) var data: AppData
+    /// Set when a goal is first met; the UI shows a congrats alert and clears it.
+    @Published var metGoal: Goal?
+    private var timer: Timer?
 
     static let directory: URL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -39,6 +91,25 @@ final class Store: ObservableObject {
             data = AppData(projects: [Project(name: "My Project")], entries: [])
             save()
         }
+        if data.version < 2 {
+            seedFirstGoal()
+            data.version = 2
+            save()
+        }
+        refreshGoals()
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.refreshGoals()
+        }
+    }
+
+    /// 15 hours from today through next Wednesday.
+    private func seedFirstGoal() {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let nextWednesday = cal.nextDate(after: today, matching: DateComponents(weekday: 4),
+                                         matchingPolicy: .nextTime)!
+        data.goals.append(Goal(projectID: project.id, name: "Weekly goal", hours: 15,
+                               start: today, end: nextWednesday, repeats: false))
     }
 
     var project: Project { data.projects[0] }
@@ -51,12 +122,73 @@ final class Store: ObservableObject {
         data.entries.filter { $0.projectID == project.id }.sorted { $0.start > $1.start }
     }
 
-    func total(since: Date, now: Date = Date()) -> TimeInterval {
+    func total(since: Date, until: Date = .distantFuture, now: Date = Date()) -> TimeInterval {
         entries.reduce(0) { sum, e in
             let start = max(e.start, since)
-            let end = e.end ?? now
+            let end = min(e.end ?? now, until)
             return sum + max(0, end.timeIntervalSince(start))
         }
+    }
+
+    // MARK: goals
+
+    var activeGoals: [Goal] {
+        data.goals.filter { $0.projectID == project.id && !$0.archived }.sorted { $0.start < $1.start }
+    }
+
+    /// Every goal, newest first, for use as a template.
+    var allGoals: [Goal] {
+        data.goals.filter { $0.projectID == project.id }.sorted { $0.start > $1.start }
+    }
+
+    func progress(_ goal: Goal, now: Date = Date()) -> TimeInterval {
+        total(since: goal.start, until: goal.endExclusive, now: now)
+    }
+
+    func hasSuccessor(_ goal: Goal) -> Bool {
+        data.goals.contains { $0.previousGoalID == goal.id }
+    }
+
+    func saveGoal(_ goal: Goal) {
+        var goal = goal
+        if progress(goal) < goal.target { goal.congratulated = false }
+        if let i = data.goals.firstIndex(where: { $0.id == goal.id }) {
+            data.goals[i] = goal
+        } else {
+            data.goals.append(goal)
+        }
+        save()
+        refreshGoals()
+    }
+
+    func deleteGoal(id: UUID) {
+        data.goals.removeAll { $0.id == id }
+        save()
+    }
+
+    /// Fires congrats for newly met goals, and archives (or rolls over) goals that have ended.
+    func refreshGoals(now: Date = Date()) {
+        let today = Calendar.current.startOfDay(for: now)
+        var changed = false
+        for i in data.goals.indices where !data.goals[i].archived {
+            let goal = data.goals[i]
+            if !goal.congratulated && progress(goal, now: now) >= goal.target {
+                data.goals[i].congratulated = true
+                changed = true
+                if metGoal == nil { metGoal = data.goals[i] }
+            }
+            if now >= goal.endExclusive {
+                data.goals[i].archived = true
+                changed = true
+                if goal.repeats && !hasSuccessor(goal) {
+                    let period = goal.nextPeriod(today: today)
+                    data.goals.append(Goal(projectID: goal.projectID, name: goal.name, hours: goal.hours,
+                                           start: period.start, end: period.end, repeats: true,
+                                           previousGoalID: goal.id))
+                }
+            }
+        }
+        if changed { save() }
     }
 
     func toggle() {
@@ -73,6 +205,7 @@ final class Store: ObservableObject {
         guard let running = runningEntry, let i = data.entries.firstIndex(of: running) else { return }
         data.entries[i].end = Date()
         save()
+        refreshGoals()
     }
 
     func renameProject(_ name: String) {
@@ -85,6 +218,7 @@ final class Store: ObservableObject {
     func addEntry(start: Date, end: Date) {
         data.entries.append(Entry(projectID: project.id, start: start, end: end))
         save()
+        refreshGoals()
     }
 
     func updateEntry(id: UUID, start: Date, end: Date?) {
@@ -92,6 +226,7 @@ final class Store: ObservableObject {
         data.entries[i].start = start
         data.entries[i].end = end
         save()
+        refreshGoals()
     }
 
     func delete(id: UUID) {
