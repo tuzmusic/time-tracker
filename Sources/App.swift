@@ -45,11 +45,13 @@ final class EntryDraft: ObservableObject, Identifiable {
     let isRunning: Bool
     @Published var start: Date
     @Published var end: Date
+    @Published var description: String
     @Published var confirmingDelete = false
 
     init(entry: Entry? = nil) {
         entryID = entry?.id
         isRunning = entry != nil && entry?.end == nil
+        description = entry?.description ?? ""
         if let entry {
             start = entry.start
             end = entry.end ?? Date()
@@ -73,6 +75,7 @@ struct EntrySheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(draft.entryID == nil ? "Add Entry" : "Edit Entry").font(.headline)
             Form {
+                TextField("Description", text: $draft.description, prompt: Text("Optional"))
                 DatePicker("Start", selection: $draft.start)
                 if draft.isRunning {
                     LabeledContent("End", value: "Running")
@@ -130,9 +133,10 @@ struct ContentView: View {
         .sheet(item: $ui.entryDraft) { draft in
             EntrySheet(draft: draft, onSave: {
                 if let id = draft.entryID {
-                    store.updateEntry(id: id, start: draft.start, end: draft.isRunning ? nil : draft.end)
+                    store.updateEntry(id: id, start: draft.start, end: draft.isRunning ? nil : draft.end,
+                                      description: draft.description)
                 } else {
-                    store.addEntry(start: draft.start, end: draft.end)
+                    store.addEntry(start: draft.start, end: draft.end, description: draft.description)
                 }
                 ui.entryDraft = nil
             }, onCancel: { ui.entryDraft = nil }, onDelete: {
@@ -259,13 +263,23 @@ struct ContentView: View {
                 Section(group.day.formatted(.dateTime.weekday(.wide).month().day())) {
                     ForEach(group.entries) { entry in
                         HStack {
-                            Text(timeRange(entry))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(timeRange(entry))
+                                if let description = entry.description {
+                                    Text(description)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
                             Spacer()
                             Text(format(entry.duration(now: now)))
                                 .monospacedDigit()
                                 .foregroundStyle(entry.end == nil ? .green : .primary)
                         }
                         .tag(entry.id)
+                        .listRowSeparator(.visible)
+                        .listRowSeparatorTint(Color.primary.opacity(0.25))
                     }
                 }
             }

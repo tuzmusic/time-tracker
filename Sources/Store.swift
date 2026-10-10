@@ -10,6 +10,7 @@ struct Entry: Codable, Identifiable, Hashable {
     var projectID: UUID
     var start: Date
     var end: Date?
+    var description: String?
 
     func duration(now: Date = Date()) -> TimeInterval {
         (end ?? now).timeIntervalSince(start)
@@ -215,16 +216,18 @@ final class Store: ObservableObject {
         save()
     }
 
-    func addEntry(start: Date, end: Date) {
-        data.entries.append(Entry(projectID: project.id, start: start, end: end))
+    func addEntry(start: Date, end: Date, description: String?) {
+        data.entries.append(Entry(projectID: project.id, start: start, end: end,
+                                  description: Store.clean(description)))
         save()
         refreshGoals()
     }
 
-    func updateEntry(id: UUID, start: Date, end: Date?) {
+    func updateEntry(id: UUID, start: Date, end: Date?, description: String?) {
         guard let i = data.entries.firstIndex(where: { $0.id == id }) else { return }
         data.entries[i].start = start
         data.entries[i].end = end
+        data.entries[i].description = Store.clean(description)
         save()
         refreshGoals()
     }
@@ -232,6 +235,12 @@ final class Store: ObservableObject {
     func delete(id: UUID) {
         data.entries.removeAll { $0.id == id }
         save()
+    }
+
+    /// Trims whitespace; blank becomes nil.
+    private static func clean(_ text: String?) -> String? {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func save() {
