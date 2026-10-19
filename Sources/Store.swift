@@ -11,6 +11,8 @@ struct Entry: Codable, Identifiable, Hashable {
     var start: Date
     var end: Date?
     var description: String?
+    /// Entries split by pause/resume share a session.
+    var sessionID: UUID?
 
     func duration(now: Date = Date()) -> TimeInterval {
         (end ?? now).timeIntervalSince(start)
@@ -57,6 +59,8 @@ struct AppData: Codable {
     var projects: [Project]
     var entries: [Entry]
     var goals: [Goal] = []
+    /// Set while the timer is paused; resuming continues this session.
+    var pausedSessionID: UUID?
 
     init(projects: [Project], entries: [Entry]) {
         self.projects = projects
@@ -69,6 +73,7 @@ struct AppData: Codable {
         projects = try c.decode([Project].self, forKey: .projects)
         entries = try c.decode([Entry].self, forKey: .entries)
         goals = try c.decodeIfPresent([Goal].self, forKey: .goals) ?? []
+        pausedSessionID = try c.decodeIfPresent(UUID.self, forKey: .pausedSessionID)
     }
 }
 
@@ -117,6 +122,16 @@ final class Store: ObservableObject {
 
     var runningEntry: Entry? {
         data.entries.first { $0.projectID == project.id && $0.end == nil }
+    }
+
+    var isPaused: Bool { runningEntry == nil && data.pausedSessionID != nil }
+
+    /// Time in the current (running or paused) session, across pauses.
+    func sessionDuration(now: Date = Date()) -> TimeInterval {
+        guard let id = runningEntry?.sessionID ?? data.pausedSessionID else {
+            return runningEntry?.duration(now: now) ?? 0
+        }
+        return entries.filter { $0.sessionID == id }.reduce(0) { $0 + $1.duration(now: now) }
     }
 
     var entries: [Entry] {
@@ -192,19 +207,40 @@ final class Store: ObservableObject {
         if changed { save() }
     }
 
+    /// Start when idle, pause when running, resume when paused.
     func toggle() {
-        runningEntry == nil ? start() : stop()
+        if runningEntry != nil { pause() } else if isPaused { resume() } else { start() }
     }
 
     func start() {
         guard runningEntry == nil else { return }
-        data.entries.append(Entry(projectID: project.id, start: Date()))
+        data.pausedSessionID = nil
+        data.entries.append(Entry(projectID: project.id, start: Date(), sessionID: UUID()))
+        save()
+    }
+
+    func pause() {
+        guard let running = runningEntry, let i = data.entries.firstIndex(of: running) else { return }
+        let session = running.sessionID ?? UUID()
+        data.entries[i].sessionID = session
+        data.entries[i].end = Date()
+        data.pausedSessionID = session
+        save()
+        refreshGoals()
+    }
+
+    func resume() {
+        guard runningEntry == nil, let session = data.pausedSessionID else { return }
+        data.pausedSessionID = nil
+        data.entries.append(Entry(projectID: project.id, start: Date(), sessionID: session))
         save()
     }
 
     func stop() {
-        guard let running = runningEntry, let i = data.entries.firstIndex(of: running) else { return }
-        data.entries[i].end = Date()
+        data.pausedSessionID = nil
+        if let running = runningEntry, let i = data.entries.firstIndex(of: running) {
+            data.entries[i].end = Date()
+        }
         save()
         refreshGoals()
     }
