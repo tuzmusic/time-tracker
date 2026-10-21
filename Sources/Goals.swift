@@ -28,7 +28,7 @@ final class GoalDraft: ObservableObject, Identifiable {
         existing = nil
         let today = Calendar.current.startOfDay(for: Date())
         start = today
-        end = Calendar.current.date(byAdding: .day, value: 6, to: today)!
+        end = Calendar.current.date(byAdding: .day, value: 7, to: today)!
         if let template { apply(template) }
     }
 
@@ -37,22 +37,20 @@ final class GoalDraft: ObservableObject, Identifiable {
         name = template.name
         hours = template.hours
         repeats = template.repeats
-        (start, end) = template.nextPeriod(today: Calendar.current.startOfDay(for: Date()))
+        (start, end) = template.nextPeriod(now: Date())
     }
 
     var isValid: Bool {
-        !name.trimmingCharacters(in: .whitespaces).isEmpty && hours > 0
-            && Calendar.current.startOfDay(for: end) >= Calendar.current.startOfDay(for: start)
+        !name.trimmingCharacters(in: .whitespaces).isEmpty && hours > 0 && end > start
     }
 
     func makeGoal(projectID: UUID) -> Goal {
-        let cal = Calendar.current
         var goal = existing ?? Goal(projectID: projectID, name: "", hours: 0, start: start, end: end,
                                     repeats: false, previousGoalID: templateID)
         goal.name = name.trimmingCharacters(in: .whitespaces)
         goal.hours = hours
-        goal.start = cal.startOfDay(for: start)
-        goal.end = cal.startOfDay(for: end)
+        goal.start = start
+        goal.end = end
         goal.repeats = repeats
         return goal
     }
@@ -79,8 +77,8 @@ struct GoalSheet: View {
                 }
                 TextField("Name", text: $draft.name)
                 TextField("Hours", value: $draft.hours, format: .number)
-                DatePicker("Start", selection: $draft.start, displayedComponents: .date)
-                DatePicker("End", selection: $draft.end, displayedComponents: .date)
+                DatePicker("Start", selection: $draft.start, displayedComponents: [.date, .hourAndMinute])
+                DatePicker("End", selection: $draft.end, displayedComponents: [.date, .hourAndMinute])
                 Toggle("Repeat", isOn: $draft.repeats)
                 Text(draft.repeats
                      ? "When it ends, the same goal starts again for the following week."
@@ -146,13 +144,11 @@ struct GoalRow: View {
 
     private var details: String {
         var parts = [goalDateRange(goal.start, goal.end)]
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: now)
-        if today < goal.start {
-            parts.append("starts \(goal.start.formatted(.dateTime.weekday(.wide)))")
+        if now < goal.start {
+            parts.append("starts \(goal.start.formatted(.dateTime.weekday(.wide).hour().minute()))")
         } else {
-            let days = (cal.dateComponents([.day], from: today, to: goal.end).day ?? 0) + 1
-            parts.append(days == 1 ? "last day" : "\(days) days left")
+            let hours = Int(goal.end.timeIntervalSince(now) / 3600)
+            parts.append(hours < 24 ? "\(hours)h left" : "\(hours / 24) days left")
         }
         parts.append(met ? "done!" : "\(hm(goal.target - progress)) to go")
         return parts.joined(separator: " · ")
@@ -165,6 +161,6 @@ struct GoalRow: View {
 }
 
 func goalDateRange(_ start: Date, _ end: Date) -> String {
-    let style = Date.FormatStyle.dateTime.weekday(.abbreviated).month(.abbreviated).day()
+    let style = Date.FormatStyle.dateTime.weekday(.abbreviated).month(.abbreviated).day().hour().minute()
     return "\(start.formatted(style)) – \(end.formatted(style))"
 }

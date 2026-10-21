@@ -17,15 +17,14 @@ struct Entry: Codable, Identifiable, Hashable {
     }
 }
 
-/// A target number of hours over an inclusive range of days.
+/// A target number of hours between two moments.
 struct Goal: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var projectID: UUID
     var name: String
     var hours: Double
-    /// Start of the first day.
     var start: Date
-    /// Start of the last day (inclusive).
+    /// Exclusive: the goal is over once this moment passes.
     var end: Date
     /// When the goal ends, roll it over to the next week instead of just archiving it.
     var repeats: Bool
@@ -35,16 +34,15 @@ struct Goal: Codable, Identifiable, Hashable {
     var previousGoalID: UUID?
 
     var target: TimeInterval { hours * 3600 }
-    var endExclusive: Date { Calendar.current.date(byAdding: .day, value: 1, to: end)! }
 
-    /// The same days shifted forward by the fewest whole weeks (at least one)
-    /// that makes the period still current on `today`.
-    func nextPeriod(today: Date) -> (start: Date, end: Date) {
+    /// The same period shifted forward by the fewest whole weeks (at least one)
+    /// that makes it still current at `now`.
+    func nextPeriod(now: Date) -> (start: Date, end: Date) {
         let cal = Calendar.current
         var weeks = 1
         while true {
             let e = cal.date(byAdding: .day, value: 7 * weeks, to: end)!
-            if e >= today {
+            if e > now {
                 return (cal.date(byAdding: .day, value: 7 * weeks, to: start)!, e)
             }
             weeks += 1
@@ -92,9 +90,16 @@ final class Store: ObservableObject {
             data = AppData(projects: [Project(name: "My Project")], entries: [])
             save()
         }
-        if data.version < 2 {
-            seedFirstGoal()
-            data.version = 2
+        if data.version < 3 {
+            if data.version < 2 {
+                seedFirstGoal()
+            } else {
+                // v2 stored `end` as the start of the last day, inclusive.
+                for i in data.goals.indices {
+                    data.goals[i].end = Calendar.current.date(byAdding: .day, value: 1, to: data.goals[i].end)!
+                }
+            }
+            data.version = 3
             save()
         }
         refreshGoals()
@@ -103,14 +108,14 @@ final class Store: ObservableObject {
         }
     }
 
-    /// 15 hours from today through next Wednesday.
+    /// 15 hours from today through the end of next Wednesday.
     private func seedFirstGoal() {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let nextWednesday = cal.nextDate(after: today, matching: DateComponents(weekday: 4),
                                          matchingPolicy: .nextTime)!
-        data.goals.append(Goal(projectID: project.id, name: "Weekly goal", hours: 15,
-                               start: today, end: nextWednesday, repeats: false))
+        data.goals.append(Goal(projectID: project.id, name: "Weekly goal", hours: 15, start: today,
+                               end: cal.date(byAdding: .day, value: 1, to: nextWednesday)!, repeats: false))
     }
 
     var project: Project { data.projects[0] }
@@ -143,7 +148,7 @@ final class Store: ObservableObject {
     }
 
     func progress(_ goal: Goal, now: Date = Date()) -> TimeInterval {
-        total(since: goal.start, until: goal.endExclusive, now: now)
+        total(since: goal.start, until: goal.end, now: now)
     }
 
     func hasSuccessor(_ goal: Goal) -> Bool {
@@ -169,7 +174,6 @@ final class Store: ObservableObject {
 
     /// Fires congrats for newly met goals, and archives (or rolls over) goals that have ended.
     func refreshGoals(now: Date = Date()) {
-        let today = Calendar.current.startOfDay(for: now)
         var changed = false
         for i in data.goals.indices where !data.goals[i].archived {
             let goal = data.goals[i]
@@ -178,11 +182,11 @@ final class Store: ObservableObject {
                 changed = true
                 if metGoal == nil { metGoal = data.goals[i] }
             }
-            if now >= goal.endExclusive {
+            if now >= goal.end {
                 data.goals[i].archived = true
                 changed = true
                 if goal.repeats && !hasSuccessor(goal) {
-                    let period = goal.nextPeriod(today: today)
+                    let period = goal.nextPeriod(now: now)
                     data.goals.append(Goal(projectID: goal.projectID, name: goal.name, hours: goal.hours,
                                            start: period.start, end: period.end, repeats: true,
                                            previousGoalID: goal.id))
