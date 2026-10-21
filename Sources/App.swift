@@ -17,12 +17,19 @@ struct TimeTrackerApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Start Timer") { store.start() }
                     .keyboardShortcut("n")
-                    .disabled(store.runningEntry != nil)
+                    .disabled(store.runningEntry != nil || store.isPaused)
             }
             CommandGroup(replacing: .saveItem) {
                 Button("Stop Timer") { store.stop() }
                     .keyboardShortcut("s")
-                    .disabled(store.runningEntry == nil)
+                    .disabled(store.runningEntry == nil && !store.isPaused)
+            }
+            CommandGroup(replacing: .printItem) {
+                Button(store.isPaused ? "Resume Timer" : "Pause Timer") {
+                    store.isPaused ? store.resume() : store.pause()
+                }
+                .keyboardShortcut("p")
+                .disabled(store.runningEntry == nil && !store.isPaused)
             }
         }
     }
@@ -192,18 +199,32 @@ struct ContentView: View {
                     .help("Double-click to rename")
             }
 
-            Text(format(store.runningEntry?.duration(now: now) ?? 0))
+            Text(format(store.sessionDuration(now: now)))
                 .font(.system(size: 44, weight: .light, design: .monospaced))
                 .foregroundStyle(store.runningEntry == nil ? .secondary : .primary)
+                .overlay(alignment: .bottom) {
+                    if store.isPaused {
+                        Text("Paused").font(.caption).foregroundStyle(.orange).offset(y: 14)
+                    }
+                }
 
-            Button(action: store.toggle) {
-                Text(store.runningEntry == nil ? "Start" : "Stop")
-                    .frame(width: 120)
+            HStack(spacing: 10) {
+                Button(action: store.toggle) {
+                    Text(store.runningEntry != nil ? "Pause" : store.isPaused ? "Resume" : "Start")
+                        .frame(width: 100)
+                }
+                .tint(store.runningEntry != nil ? .orange : .green)
+                .keyboardShortcut(.space, modifiers: [])
+
+                if store.runningEntry != nil || store.isPaused {
+                    Button(action: store.stop) {
+                        Text("Stop").frame(width: 100)
+                    }
+                    .tint(.red)
+                }
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
-            .tint(store.runningEntry == nil ? .green : .red)
-            .keyboardShortcut(.space, modifiers: [])
 
             HStack(spacing: 24) {
                 stat("Today", store.total(since: Calendar.current.startOfDay(for: now), now: now))
