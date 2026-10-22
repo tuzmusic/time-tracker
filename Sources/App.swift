@@ -228,8 +228,9 @@ struct ContentView: View {
 
             HStack(spacing: 24) {
                 stat("Today", store.total(since: Calendar.current.startOfDay(for: now), now: now))
-                stat("This week", store.total(since: startOfWeek(now), now: now))
-                stat("All time", store.total(since: .distantPast, now: now))
+                if let goal = store.activeGoals.first(where: { $0.start <= now && now < $0.end }) {
+                    stat(goal.name, store.progress(goal, now: now))
+                }
             }
         }
         .padding(20)
@@ -374,10 +375,6 @@ struct ContentView: View {
         let start = e.start.formatted(date: .omitted, time: .shortened)
         let end = e.end?.formatted(date: .omitted, time: .shortened) ?? "now"
         return "\(start) – \(end)"
-    }
-
-    private func startOfWeek(_ date: Date) -> Date {
-        Calendar.current.dateInterval(of: .weekOfYear, for: date)?.start ?? date
     }
 
     private func format(_ t: TimeInterval, seconds: Bool = true) -> String {
