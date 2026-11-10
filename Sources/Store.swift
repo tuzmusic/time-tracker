@@ -5,17 +5,66 @@ struct Project: Codable, Identifiable, Hashable {
     var name: String
 }
 
-struct Entry: Codable, Identifiable, Hashable {
+/// One continuous stretch of work. Pausing ends a chunk; resuming starts a new one.
+struct Chunk: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
-    var projectID: UUID
     var start: Date
     var end: Date?
     var description: String?
-    /// Entries split by pause/resume share a session.
-    var sessionID: UUID?
 
     func duration(now: Date = Date()) -> TimeInterval {
         (end ?? now).timeIntervalSince(start)
+    }
+}
+
+/// A unit of work made of one or more chunks, oldest first.
+struct Entry: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+    var projectID: UUID
+    var description: String?
+    var chunks: [Chunk]
+    /// Pre-v4 files stored one chunk per entry, linked by pause/resume session. Read only.
+    private(set) var legacySessionID: UUID?
+
+    init(projectID: UUID, description: String? = nil, chunks: [Chunk]) {
+        self.projectID = projectID
+        self.description = description
+        self.chunks = chunks
+    }
+
+    var start: Date { chunks.first?.start ?? .distantPast }
+    var end: Date? { chunks.last?.end }
+    var isRunning: Bool { chunks.contains { $0.end == nil } }
+
+    func duration(now: Date = Date()) -> TimeInterval {
+        chunks.reduce(0) { $0 + $1.duration(now: now) }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, projectID, description, chunks
+        case start, end, sessionID // legacy
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        projectID = try c.decode(UUID.self, forKey: .projectID)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        if let chunks = try c.decodeIfPresent([Chunk].self, forKey: .chunks) {
+            self.chunks = chunks
+        } else {
+            chunks = [Chunk(start: try c.decode(Date.self, forKey: .start),
+                            end: try c.decodeIfPresent(Date.self, forKey: .end))]
+            legacySessionID = try c.decodeIfPresent(UUID.self, forKey: .sessionID)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(projectID, forKey: .projectID)
+        try c.encodeIfPresent(description, forKey: .description)
+        try c.encode(chunks, forKey: .chunks)
     }
 }
 
@@ -57,12 +106,19 @@ struct AppData: Codable {
     var projects: [Project]
     var entries: [Entry]
     var goals: [Goal] = []
-    /// Set while the timer is paused; resuming continues this session.
-    var pausedSessionID: UUID?
+    /// Set while the timer is paused; resuming adds a chunk to this entry.
+    var pausedEntryID: UUID?
+    /// Pre-v4 equivalent of `pausedEntryID`. Read only.
+    private(set) var legacyPausedSessionID: UUID?
 
     init(projects: [Project], entries: [Entry]) {
         self.projects = projects
         self.entries = entries
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, projects, entries, goals, pausedEntryID
+        case pausedSessionID // legacy
     }
 
     init(from decoder: Decoder) throws {
@@ -71,7 +127,46 @@ struct AppData: Codable {
         projects = try c.decode([Project].self, forKey: .projects)
         entries = try c.decode([Entry].self, forKey: .entries)
         goals = try c.decodeIfPresent([Goal].self, forKey: .goals) ?? []
-        pausedSessionID = try c.decodeIfPresent(UUID.self, forKey: .pausedSessionID)
+        pausedEntryID = try c.decodeIfPresent(UUID.self, forKey: .pausedEntryID)
+        legacyPausedSessionID = try c.decodeIfPresent(UUID.self, forKey: .pausedSessionID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version)
+        try c.encode(projects, forKey: .projects)
+        try c.encode(entries, forKey: .entries)
+        try c.encode(goals, forKey: .goals)
+        try c.encodeIfPresent(pausedEntryID, forKey: .pausedEntryID)
+    }
+
+    /// v3 → v4: entries that shared a pause/resume session become one entry with several chunks.
+    /// In merged entries each old description moves onto its chunk.
+    mutating func mergeLegacySessions() {
+        var merged: [Entry] = []
+        var indexBySession: [UUID: Int] = [:]
+        for entry in entries.sorted(by: { $0.start < $1.start }) {
+            guard let session = entry.legacySessionID else {
+                merged.append(entry)
+                continue
+            }
+            if let i = indexBySession[session] {
+                if merged[i].chunks.count == 1 {
+                    merged[i].chunks[0].description = merged[i].description
+                    merged[i].description = nil
+                }
+                var chunk = entry.chunks[0]
+                chunk.description = entry.description
+                merged[i].chunks.append(chunk)
+            } else {
+                indexBySession[session] = merged.count
+                merged.append(entry)
+            }
+            if session == legacyPausedSessionID {
+                pausedEntryID = merged[indexBySession[session]!].id
+            }
+        }
+        entries = merged
     }
 }
 
@@ -107,6 +202,11 @@ final class Store: ObservableObject {
             data.version = 3
             save()
         }
+        if data.version < 4 {
+            data.mergeLegacySessions()
+            data.version = 4
+            save()
+        }
         refreshGoals()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refreshGoals()
@@ -126,17 +226,19 @@ final class Store: ObservableObject {
     var project: Project { data.projects[0] }
 
     var runningEntry: Entry? {
-        data.entries.first { $0.projectID == project.id && $0.end == nil }
+        data.entries.first { $0.projectID == project.id && $0.isRunning }
     }
 
-    var isPaused: Bool { runningEntry == nil && data.pausedSessionID != nil }
+    var pausedEntry: Entry? {
+        guard runningEntry == nil, let id = data.pausedEntryID else { return nil }
+        return data.entries.first { $0.id == id }
+    }
 
-    /// Time in the current (running or paused) session, across pauses.
+    var isPaused: Bool { pausedEntry != nil }
+
+    /// Time in the current (running or paused) entry, across pauses.
     func sessionDuration(now: Date = Date()) -> TimeInterval {
-        guard let id = runningEntry?.sessionID ?? data.pausedSessionID else {
-            return runningEntry?.duration(now: now) ?? 0
-        }
-        return entries.filter { $0.sessionID == id }.reduce(0) { $0 + $1.duration(now: now) }
+        (runningEntry ?? pausedEntry)?.duration(now: now) ?? 0
     }
 
     var entries: [Entry] {
@@ -144,9 +246,9 @@ final class Store: ObservableObject {
     }
 
     func total(since: Date, until: Date = .distantFuture, now: Date = Date()) -> TimeInterval {
-        entries.reduce(0) { sum, e in
-            let start = max(e.start, since)
-            let end = min(e.end ?? now, until)
+        entries.flatMap(\.chunks).reduce(0) { sum, c in
+            let start = max(c.start, since)
+            let end = min(c.end ?? now, until)
             return sum + max(0, end.timeIntervalSince(start))
         }
     }
@@ -218,32 +320,30 @@ final class Store: ObservableObject {
 
     func start() {
         guard runningEntry == nil else { return }
-        data.pausedSessionID = nil
-        data.entries.append(Entry(projectID: project.id, start: Date(), sessionID: UUID()))
+        data.pausedEntryID = nil
+        data.entries.append(Entry(projectID: project.id, chunks: [Chunk(start: Date())]))
         save()
     }
 
     func pause() {
-        guard let running = runningEntry, let i = data.entries.firstIndex(of: running) else { return }
-        let session = running.sessionID ?? UUID()
-        data.entries[i].sessionID = session
-        data.entries[i].end = Date()
-        data.pausedSessionID = session
+        guard let i = data.entries.firstIndex(where: { $0.id == runningEntry?.id }) else { return }
+        data.entries[i].chunks[data.entries[i].chunks.count - 1].end = Date()
+        data.pausedEntryID = data.entries[i].id
         save()
         refreshGoals()
     }
 
     func resume() {
-        guard runningEntry == nil, let session = data.pausedSessionID else { return }
-        data.pausedSessionID = nil
-        data.entries.append(Entry(projectID: project.id, start: Date(), sessionID: session))
+        guard let i = data.entries.firstIndex(where: { $0.id == pausedEntry?.id }) else { return }
+        data.pausedEntryID = nil
+        data.entries[i].chunks.append(Chunk(start: Date()))
         save()
     }
 
     func stop() {
-        data.pausedSessionID = nil
-        if let running = runningEntry, let i = data.entries.firstIndex(of: running) {
-            data.entries[i].end = Date()
+        data.pausedEntryID = nil
+        if let i = data.entries.firstIndex(where: { $0.id == runningEntry?.id }) {
+            data.entries[i].chunks[data.entries[i].chunks.count - 1].end = Date()
         }
         save()
         refreshGoals()
@@ -257,24 +357,44 @@ final class Store: ObservableObject {
     }
 
     func addEntry(start: Date, end: Date, description: String?) {
-        data.entries.append(Entry(projectID: project.id, start: start, end: end,
-                                  description: Store.clean(description)))
+        data.entries.append(Entry(projectID: project.id, description: Store.clean(description),
+                                  chunks: [Chunk(start: start, end: end)]))
         save()
         refreshGoals()
     }
 
-    func updateEntry(id: UUID, start: Date, end: Date?, description: String?) {
+    func updateEntry(id: UUID, description: String?) {
         guard let i = data.entries.firstIndex(where: { $0.id == id }) else { return }
-        data.entries[i].start = start
-        data.entries[i].end = end
         data.entries[i].description = Store.clean(description)
+        save()
+    }
+
+    func updateChunk(entryID: UUID, chunkID: UUID, start: Date, end: Date?, description: String?) {
+        guard let i = data.entries.firstIndex(where: { $0.id == entryID }),
+              let j = data.entries[i].chunks.firstIndex(where: { $0.id == chunkID }) else { return }
+        data.entries[i].chunks[j].start = start
+        data.entries[i].chunks[j].end = end
+        data.entries[i].chunks[j].description = Store.clean(description)
+        data.entries[i].chunks.sort { $0.start < $1.start }
         save()
         refreshGoals()
     }
 
     func delete(id: UUID) {
         data.entries.removeAll { $0.id == id }
+        if data.pausedEntryID == id { data.pausedEntryID = nil }
         save()
+    }
+
+    /// Deleting an entry's only chunk deletes the entry.
+    func deleteChunk(entryID: UUID, chunkID: UUID) {
+        guard let i = data.entries.firstIndex(where: { $0.id == entryID }) else { return }
+        data.entries[i].chunks.removeAll { $0.id == chunkID }
+        if data.entries[i].chunks.isEmpty {
+            delete(id: entryID)
+        } else {
+            save()
+        }
     }
 
     /// Trims whitespace; blank becomes nil.

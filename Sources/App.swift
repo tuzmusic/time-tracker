@@ -41,15 +41,25 @@ final class UIState: ObservableObject {
     @Published var entryDraft: EntryDraft?
     @Published var selection: UUID?
     @Published var pendingDelete: UUID?
+    /// Multi-chunk entries whose chunks are showing. Collapsed by default.
+    @Published var expanded: Set<UUID> = []
     @Published var goalDraft: GoalDraft?
     @Published var pendingGoalDelete: UUID?
 }
 
-/// Backing state for the add/edit entry sheet. `entryID == nil` means a new manual entry.
+/// Backing state for the add/edit sheet. Edits a whole entry, one chunk, or (`entryID == nil`)
+/// a new manual entry. A single-chunk entry edits its chunk's times directly.
 final class EntryDraft: ObservableObject, Identifiable {
     let id = UUID()
     let entryID: UUID?
+    /// The chunk whose times are being edited; nil for a new entry or a multi-chunk entry.
+    let chunkID: UUID?
+    /// Editing an entry rather than one of its chunks.
+    let isEntry: Bool
     let isRunning: Bool
+    let chunkCount: Int
+    /// A single-chunk entry's own chunk description, passed through untouched.
+    let chunkDescription: String?
     @Published var start: Date
     @Published var end: Date
     @Published var description: String
@@ -57,7 +67,11 @@ final class EntryDraft: ObservableObject, Identifiable {
 
     init(entry: Entry? = nil) {
         entryID = entry?.id
-        isRunning = entry != nil && entry?.end == nil
+        isEntry = true
+        isRunning = entry?.isRunning ?? false
+        chunkCount = entry?.chunks.count ?? 1
+        chunkID = chunkCount == 1 ? entry?.chunks.first?.id : nil
+        chunkDescription = chunkCount == 1 ? entry?.chunks.first?.description : nil
         description = entry?.description ?? ""
         if let entry {
             start = entry.start
@@ -69,7 +83,28 @@ final class EntryDraft: ObservableObject, Identifiable {
         }
     }
 
-    var isValid: Bool { isRunning ? start <= Date() : end > start }
+    init(chunk: Chunk, of entry: Entry) {
+        entryID = entry.id
+        chunkID = chunk.id
+        isEntry = false
+        isRunning = chunk.end == nil
+        chunkCount = entry.chunks.count
+        chunkDescription = nil
+        description = chunk.description ?? ""
+        start = chunk.start
+        end = chunk.end ?? Date()
+    }
+
+    var editsTimes: Bool { entryID == nil || chunkID != nil }
+
+    var isValid: Bool {
+        guard editsTimes else { return true }
+        return isRunning ? start <= Date() : end > start
+    }
+
+    var title: String {
+        entryID == nil ? "Add Entry" : isEntry ? "Edit Entry" : "Edit Chunk"
+    }
 }
 
 struct EntrySheet: View {
@@ -80,15 +115,19 @@ struct EntrySheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(draft.entryID == nil ? "Add Entry" : "Edit Entry").font(.headline)
+            Text(draft.title).font(.headline)
             Form {
                 TextField("Description", text: $draft.description, prompt: Text("Optional"))
-                DatePicker("Start", selection: $draft.start)
-                if draft.isRunning {
-                    LabeledContent("End", value: "Running")
+                if draft.editsTimes {
+                    DatePicker("Start", selection: $draft.start)
+                    if draft.isRunning {
+                        LabeledContent("End", value: "Running")
+                    } else {
+                        DatePicker("End", selection: $draft.end)
+                        LabeledContent("Duration", value: durationText)
+                    }
                 } else {
-                    DatePicker("End", selection: $draft.end)
-                    LabeledContent("Duration", value: durationText)
+                    LabeledContent("Chunks", value: "\(draft.chunkCount) — expand the entry to edit them")
                 }
             }
             HStack {
@@ -104,10 +143,13 @@ struct EntrySheet: View {
         }
         .padding(20)
         .frame(width: 340)
-        .confirmationDialog("Delete this entry?", isPresented: $draft.confirmingDelete) {
+        .confirmationDialog(draft.isEntry ? "Delete this entry?" : "Delete this chunk?",
+                            isPresented: $draft.confirmingDelete) {
             Button("Delete", role: .destructive, action: onDelete)
         } message: {
-            Text("This can't be undone.")
+            Text(draft.isEntry && draft.chunkCount > 1
+                 ? "All \(draft.chunkCount) chunks will be deleted. This can't be undone."
+                 : "This can't be undone.")
         }
     }
 
@@ -139,15 +181,25 @@ struct ContentView: View {
         }
         .sheet(item: $ui.entryDraft) { draft in
             EntrySheet(draft: draft, onSave: {
-                if let id = draft.entryID {
-                    store.updateEntry(id: id, start: draft.start, end: draft.isRunning ? nil : draft.end,
-                                      description: draft.description)
+                if let entryID = draft.entryID {
+                    if draft.isEntry { store.updateEntry(id: entryID, description: draft.description) }
+                    if let chunkID = draft.chunkID {
+                        store.updateChunk(entryID: entryID, chunkID: chunkID, start: draft.start,
+                                          end: draft.isRunning ? nil : draft.end,
+                                          description: draft.isEntry ? draft.chunkDescription : draft.description)
+                    }
                 } else {
                     store.addEntry(start: draft.start, end: draft.end, description: draft.description)
                 }
                 ui.entryDraft = nil
             }, onCancel: { ui.entryDraft = nil }, onDelete: {
-                if let id = draft.entryID { store.delete(id: id) }
+                if let entryID = draft.entryID {
+                    if draft.isEntry {
+                        store.delete(id: entryID)
+                    } else if let chunkID = draft.chunkID {
+                        store.deleteChunk(entryID: entryID, chunkID: chunkID)
+                    }
+                }
                 ui.entryDraft = nil
             })
         }
@@ -229,7 +281,9 @@ struct ContentView: View {
             HStack(spacing: 24) {
                 stat("Today", store.total(since: Calendar.current.startOfDay(for: now), now: now))
                 if let goal = store.activeGoals.first(where: { $0.start <= now && now < $0.end }) {
-                    stat(goal.name, store.progress(goal, now: now))
+                    let progress = store.progress(goal, now: now)
+                    stat(goal.name, progress)
+                    stat("To go", max(goal.target - progress, 0))
                 }
             }
         }
@@ -282,26 +336,29 @@ struct ContentView: View {
     private func entryList(now: Date) -> some View {
         List(selection: $ui.selection) {
             ForEach(groupedByDay(), id: \.day) { group in
-                Section(group.day.formatted(.dateTime.weekday(.wide).month().day())) {
+                Section {
                     ForEach(group.entries) { entry in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(timeRange(entry))
-                                if let description = entry.description {
-                                    Text(description)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
+                        if entry.chunks.count > 1 {
+                            DisclosureGroup(isExpanded: expandedBinding(entry.id)) {
+                                ForEach(entry.chunks.reversed()) { chunk in
+                                    row(start: chunk.start, end: chunk.end, description: chunk.description,
+                                        duration: chunk.duration(now: now), running: chunk.end == nil)
+                                        .tag(chunk.id)
                                 }
+                            } label: {
+                                entryRow(entry, now: now)
                             }
-                            Spacer()
-                            Text(format(entry.duration(now: now)))
-                                .monospacedDigit()
-                                .foregroundStyle(entry.end == nil ? .green : .primary)
+                            .tag(entry.id)
+                        } else {
+                            entryRow(entry, now: now).tag(entry.id)
                         }
-                        .tag(entry.id)
-                        .listRowSeparator(.visible)
-                        .listRowSeparatorTint(Color.primary.opacity(0.25))
+                    }
+                } header: {
+                    HStack {
+                        Text(group.day.formatted(.dateTime.weekday(.wide).month().day()))
+                        Spacer()
+                        Text(format(group.entries.reduce(0) { $0 + $1.duration(now: now) }, seconds: false))
+                            .monospacedDigit()
                     }
                 }
             }
@@ -317,13 +374,14 @@ struct ContentView: View {
         .onDeleteCommand {
             ui.pendingDelete = ui.selection
         }
-        .confirmationDialog("Delete this entry?", isPresented: Binding(
+        .confirmationDialog(pendingDeleteIsChunk ? "Delete this chunk?" : "Delete this entry?",
+                            isPresented: Binding(
             get: { ui.pendingDelete != nil },
             set: { if !$0 { ui.pendingDelete = nil } }
         )) {
             Button("Delete", role: .destructive) {
                 if let id = ui.pendingDelete {
-                    store.delete(id: id)
+                    delete(id)
                     if ui.selection == id { ui.selection = nil }
                 }
             }
@@ -359,9 +417,70 @@ struct ContentView: View {
 
     // MARK: helpers
 
+    private func entryRow(_ entry: Entry, now: Date) -> some View {
+        let paused = entry.id == store.pausedEntry?.id
+        return row(start: entry.start, end: paused ? nil : entry.end, endLabel: paused ? "paused" : "now",
+                   description: entry.description, duration: entry.duration(now: now),
+                   running: entry.isRunning)
+    }
+
+    private func row(start: Date, end: Date?, endLabel: String = "now", description: String?,
+                     duration: TimeInterval, running: Bool) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(start.formatted(date: .omitted, time: .shortened)) – "
+                     + (end?.formatted(date: .omitted, time: .shortened) ?? endLabel))
+                if let description {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+            Text(format(duration))
+                .monospacedDigit()
+                .foregroundStyle(running ? .green : .primary)
+        }
+        .listRowSeparator(.visible)
+        .listRowSeparatorTint(Color.primary.opacity(0.25))
+    }
+
+    private func expandedBinding(_ id: UUID) -> Binding<Bool> {
+        Binding(
+            get: { ui.expanded.contains(id) },
+            set: { if $0 { ui.expanded.insert(id) } else { ui.expanded.remove(id) } }
+        )
+    }
+
+    /// The entry with this id, or the entry and chunk when the id is a chunk's.
+    private func lookup(_ id: UUID) -> (entry: Entry, chunk: Chunk?)? {
+        for entry in store.entries {
+            if entry.id == id { return (entry, nil) }
+            if let chunk = entry.chunks.first(where: { $0.id == id }) { return (entry, chunk) }
+        }
+        return nil
+    }
+
+    private var pendingDeleteIsChunk: Bool {
+        ui.pendingDelete.flatMap(lookup)?.chunk != nil
+    }
+
     private func edit(_ id: UUID) {
-        if let entry = store.entries.first(where: { $0.id == id }) {
-            ui.entryDraft = EntryDraft(entry: entry)
+        guard let found = lookup(id) else { return }
+        if let chunk = found.chunk {
+            ui.entryDraft = EntryDraft(chunk: chunk, of: found.entry)
+        } else {
+            ui.entryDraft = EntryDraft(entry: found.entry)
+        }
+    }
+
+    private func delete(_ id: UUID) {
+        guard let found = lookup(id) else { return }
+        if let chunk = found.chunk {
+            store.deleteChunk(entryID: found.entry.id, chunkID: chunk.id)
+        } else {
+            store.delete(id: id)
         }
     }
 
@@ -369,12 +488,6 @@ struct ContentView: View {
         let cal = Calendar.current
         let groups = Dictionary(grouping: store.entries) { cal.startOfDay(for: $0.start) }
         return groups.keys.sorted(by: >).map { ($0, groups[$0]!) }
-    }
-
-    private func timeRange(_ e: Entry) -> String {
-        let start = e.start.formatted(date: .omitted, time: .shortened)
-        let end = e.end?.formatted(date: .omitted, time: .shortened) ?? "now"
-        return "\(start) – \(end)"
     }
 
     private func format(_ t: TimeInterval, seconds: Bool = true) -> String {
